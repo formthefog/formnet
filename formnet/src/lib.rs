@@ -169,6 +169,7 @@ pub async fn respond_with_peer_invitation<'a>(
     server: ServerInfo,
     root_cidr: &CidrTree<'a>,
     keypair: KeyPair,
+    callback: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let invite = InterfaceConfig {
         interface: InterfaceInfo {
@@ -180,30 +181,21 @@ pub async fn respond_with_peer_invitation<'a>(
         server
     };
 
-    // Write to the MessageBroker under `VmmTopic` as this
-    // should represent a request for a new Instance to be added to the 
-    // network
-    let mut publisher = GenericPublisher::new("127.0.0.1:5555").await?; 
-    publisher.publish(
-        Box::new(VmmTopic),
-        Box::new(VmmEvent::NetworkSetupComplete { 
-            invite: serde_json::to_string(&invite)? 
-        })
+    let mut stream = TcpStream::connect(callback).await?;
+    stream.write_all(
+        &serde_json::to_vec(&invite)?
     ).await?;
 
     Ok(())
 }
 
-pub async fn server_respond_with_peer_invitation(invitation: InterfaceConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Write to the MessageBroker under `VmmTopic` as this
-    // should represent a request for a new Instance to be added to the 
-    // network
-    let mut publisher = GenericPublisher::new("127.0.0.1:5555").await?; 
-    publisher.publish(
-        Box::new(VmmTopic),
-        Box::new(VmmEvent::NetworkSetupComplete { 
-            invite: serde_json::to_string(&invitation)? 
-        })
+pub async fn server_respond_with_peer_invitation(
+    invitation: InterfaceConfig,
+    callback: SocketAddr
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(callback).await?;
+    stream.write_all(
+        &serde_json::to_vec(&invitation)?
     ).await?;
 
     Ok(())
@@ -513,12 +505,9 @@ async fn api_respond_with_peer_invitation<'a>(
 pub async fn api_shutdown_handler(
     mut rx: Receiver<()>
 ) {
-    loop {
-        tokio::select! {
-            res = rx.recv() => {
-                log::info!("Received shutdown signal for api server: {res:?}");
-                break;
-            }
+    tokio::select! {
+        res = rx.recv() => {
+            log::info!("Received shutdown signal for api server: {res:?}");
         }
     }
 }

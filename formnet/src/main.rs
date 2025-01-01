@@ -144,7 +144,10 @@ async fn handle_message(
                     &peer_type.into(),
                     peer_id,
                 ).await {
-                    return server_respond_with_peer_invitation(invitation).await;
+                    return server_respond_with_peer_invitation(
+                        invitation,
+                        *callback
+                    ).await;
                 }
             }
 
@@ -167,7 +170,13 @@ async fn handle_message(
             ).await {
                 println!("Creating peer...");
                 let peer: Peer = api.http_form("POST", "/admin/peers", content)?;
-                respond_with_peer_invitation(&peer, server.clone(), &cidr_tree, keypair).await?;
+                respond_with_peer_invitation(
+                    &peer,
+                    server.clone(), 
+                    &cidr_tree, 
+                    keypair, 
+                    *callback
+                ).await?;
             }
         },
         DisablePeer => {},
