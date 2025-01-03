@@ -16,9 +16,9 @@ use shared::{
 use std::net::{IpAddr, SocketAddr};
 use wireguard_control::KeyPair;
 
-fn create_database<P: AsRef<Path>>(
+pub fn create_database<P: AsRef<Path>>(
     database_path: P,
-) -> Result<Connection, Box<dyn std::error::Error>> {
+) -> Result<Connection, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let conn = Connection::open(&database_path)?;
     conn.pragma_update(None, "foreign_keys", 1)?;
     conn.execute(db::peer::CREATE_TABLE_SQL, params![])?;
@@ -53,16 +53,16 @@ pub struct InitializeOpts {
     pub listen_port: Option<u16>,
 }
 
-struct DbInitData {
-    network_name: String,
-    network_cidr: IpNet,
-    server_cidr: IpNet,
-    our_ip: IpAddr,
-    public_key_base64: String,
-    endpoint: Endpoint,
+pub struct DbInitData {
+    pub network_name: String,
+    pub network_cidr: IpNet,
+    pub server_cidr: IpNet,
+    pub our_ip: IpAddr,
+    pub public_key_base64: String,
+    pub endpoint: Endpoint,
 }
 
-fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), Error> {
+pub fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), Error> {
     const SERVER_NAME: &str = "innernet-server";
 
     let root_cidr = DatabaseCidr::create(
