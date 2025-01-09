@@ -30,9 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
 
     simple_logger::SimpleLogger::new().init().unwrap();
 
-
     let parser = Opts::parse();
-    println!("{parser:?}");
+    log::info!("{parser:?}");
 
     let interface_handle = if let Some(to_dial) = parser.dial {
         // A bootstrap node was provided, request that the 
@@ -47,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
             hex::encode(&verifying_key.to_encoded_point(false).to_bytes())
         };
         
-        println!("PublicKey: {public_key}");
+        log::info!("PublicKey: {public_key}");
         //TODO: issue challenge/response
         let response = client.post(format!("http://{to_dial}:3001/join"))
             .json(
@@ -102,18 +101,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         handle
     } else {
         // No bootstrap was provided create and serve formnet as server
+        log::info!("Attempting to start formnet server, no bootstrap provided...");
         let handle = tokio::spawn(async move {
+            log::info!("Building server config...");
             let conf = ServerConfig { config_dir: SERVER_CONFIG_DIR.into(), data_dir: SERVER_DATA_DIR.into() };
+            log::info!("Building init options...");
             let init_opts = InitializeOpts::default(); 
+            log::info!("Acquiring interface name...");
             let interface_name = InterfaceName::from_str("formnet")?;
+            log::info!("Building network opts...");
             let network_opts = NetworkOpts {
                 backend: Backend::Kernel,
                 mtu: None,
                 no_routing: false,
             };
 
+            log::info!("Initializing the server");
             init(&conf, init_opts)?;
+            log::info!("Serving the server...");
             serve(interface_name, &conf, network_opts).await?;
+            log::info!("Server shutdown, cleaning up...");
             uninstall(&interface_name, &conf, network_opts, true)?;
 
             Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(())
@@ -123,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     };
 
     let (tx, rx) = tokio::sync::broadcast::channel(3);
-    let api_shutdown = tx.subscribe();
+    let _api_shutdown = tx.subscribe();
     
     log::info!("Spawning API Server for taking join requests...");
     let api_handle = tokio::spawn(async move {
@@ -133,9 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
         let _ = axum::serve(
             listener,
             api
-        ).with_graceful_shutdown(
-            api_shutdown_handler(api_shutdown)
-        );
+        ).await?;
 
         Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(())
     });
@@ -148,11 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
                 FormnetTopic.to_string()
             ]
         ).await?;
+        log::info!("Created formnet subscriber...");
         if let Err(e) = run(
             sub,
             rx
         ).await {
-            eprintln!("Error running formnet handler: {e}");
+            log::error!("Error running formnet handler: {e}");
         }
 
         Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(())
@@ -161,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>
     tokio::signal::ctrl_c().await?;
 
     if let Err(e) = tx.send(()) {
-        println!("Error sending shutdown signal: {e}");
+        log::info!("Error sending shutdown signal: {e}");
     }
     let _ = handle.await?;
     let _ = api_handle.await?;
@@ -174,12 +180,13 @@ async fn run(
     mut subscriber: impl SubStream<Message = Vec<FormnetMessage>>,
     mut shutdown: Receiver<()>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    log::info!("Starting main formnet handler loop");
     loop {
         tokio::select! {
             Ok(msg) = subscriber.receive() => {
                 for m in msg {
                     if let Err(e) = handle_message(&m).await {
-                        eprintln!("Error handling message {m:?}: {e}");
+                        log::error!("Error handling message {m:?}: {e}");
                     }
                 }
             }
@@ -187,7 +194,7 @@ async fn run(
                 log::info!("Heartbeat...");
             }
             _ = shutdown.recv() => {
-                eprintln!("Received shutdown signal for Formnet");
+                log::error!("Received shutdown signal for Formnet");
                 break;
             }
         }
@@ -204,11 +211,14 @@ async fn handle_message(
     match message {
         AddPeer { peer_type, peer_id, callback } => {
             if is_server() {
+                log::info!("Receiving node is Server, adding peer from server...");
                 let server_config = ServerConfig { 
                     config_dir: PathBuf::from(SERVER_CONFIG_DIR), 
                     data_dir: PathBuf::from(SERVER_DATA_DIR)
                 };
+                log::info!("Built Server Config...");
                 let inet = InterfaceName::from_str(FormnetMessage::INTERFACE_NAME)?;
+                log::info!("Acquired interface name...");
                 if let Ok(invitation) = server_add_peer(
                     &inet,
                     &server_config,
@@ -229,17 +239,17 @@ async fn handle_message(
                 )?
             )?;
             let api = Api::new(&server);
-            println!("Fetching CIDRs...");
+            log::info!("Fetching CIDRs...");
             let cidrs: Vec<Cidr> = api.http("GET", "/admin/cidrs")?;
-            println!("Fetching Peers...");
+            log::info!("Fetching Peers...");
             let peers: Vec<Peer> = api.http("GET", "/admin/peers")?;
-            println!("Creating CIDR Tree...");
+            log::info!("Creating CIDR Tree...");
             let cidr_tree = CidrTree::new(&cidrs[..]);
 
             if let Ok((content, keypair)) = add_peer(
                 &peers, &cidr_tree, &peer_type.into(), peer_id
             ).await {
-                println!("Creating peer...");
+                log::info!("Creating peer...");
                 let peer: Peer = api.http_form("POST", "/admin/peers", content)?;
                 respond_with_peer_invitation(
                     &peer,
