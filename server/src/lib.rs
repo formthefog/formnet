@@ -99,8 +99,10 @@ impl ConfigFile {
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        log::info!("Attempting to get file from {}", path.as_ref().display());
         let path = path.as_ref();
         let file = File::open(path).with_path(path)?;
+        log::info!("Opened file");
         if shared::chmod(&file, 0o600)? {
             println!(
                 "{} updated permissions for {} to 0600.",
@@ -108,9 +110,16 @@ impl ConfigFile {
                 path.display()
             );
         }
-        Ok(toml::from_str(
-            &std::fs::read_to_string(path).with_path(path)?,
-        )?)
+
+        let raw_str = std::fs::read_to_string(path).with_path(path)?;
+        log::info!("File contents: {raw_str}");
+
+        let toml = toml::from_str(&raw_str)?;
+
+        log::info!("File toml: {toml:?}");
+
+        Ok(toml)
+
     }
 }
 
@@ -185,7 +194,11 @@ pub fn add_peer(
     let cidrs = DatabaseCidr::list(&conn)?;
     let cidr_tree = CidrTree::new(&cidrs[..]);
 
-    if let Some(result) = shared::prompts::add_peer(&peers, &cidr_tree, &opts)? {
+    if let Some(result) = shared::prompts::add_peer(
+        &peers,
+        &cidr_tree,
+        &opts
+    )? {
         let (peer_request, keypair, target_path, mut target_file) = result;
         log::info!("Received results from prompts, attempting to create peer in database");
         let peer = DatabasePeer::create(&conn, peer_request)?;
@@ -496,7 +509,7 @@ pub async fn serve(
         backend: network.backend,
     };
 
-    log::info!("innernet-server {} starting.", VERSION);
+    log::info!("formnet-server {} starting.", VERSION);
 
     let listener = get_listener((config.address, config.listen_port).into(), &interface)?;
 

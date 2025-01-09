@@ -1,15 +1,15 @@
-use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, path::PathBuf, str::FromStr, time::{Duration, SystemTime}};
+use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, path::PathBuf, str::FromStr, time::Duration};
 use axum::{http::StatusCode, Json};
 use hostsfile::HostsBuilder;
 use ipnet::IpNet;
 use publicip::Preference;
-use shared::{get_local_addrs, interface_config::{InterfaceConfig, InterfaceInfo}, wg, Endpoint, Interface, IpNetExt, NatOpts, NetworkOpts, RedeemContents, State, Timestring, PERSISTENT_KEEPALIVE_INTERVAL_SECS, REDEEM_TRANSITION_WAIT};
+use shared::{get_local_addrs, interface_config::{InterfaceConfig, InterfaceInfo}, wg, AddCidrOpts, Endpoint, Interface, IpNetExt, NatOpts, NetworkOpts, RedeemContents, State, PERSISTENT_KEEPALIVE_INTERVAL_SECS, REDEEM_TRANSITION_WAIT};
 use shared::{interface_config::ServerInfo, Cidr, CidrTree, Hostname, Peer, PeerContents};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::broadcast::Receiver};
-use wireguard_control::{Device, DeviceUpdate, InterfaceName, KeyPair, PeerConfigBuilder};
+use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, KeyPair, PeerConfigBuilder};
 use client::{data_store::DataStore, nat::{self, NatTraverse}, util::{self, all_installed, Api}};
 use innernet_server::{
-    initialize::{create_database, populate_database, DbInitData, InitializeOpts}, open_database_connection, ConfigFile, DatabaseCidr, DatabasePeer, ServerConfig
+    add_cidr, initialize::{create_database, populate_database, DbInitData, InitializeOpts}, open_database_connection, ConfigFile, DatabaseCidr, DatabasePeer, ServerConfig
 };
 use shared::wg::DeviceExt; 
 
@@ -36,27 +36,26 @@ pub async fn add_peer<'a>(
     peer_type: &PeerType,
     peer_id: &str
 ) -> Result<(PeerContents, KeyPair), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    log::info!("Attempting to add peer {peer_id} of {peer_type:?} to formnet");
     let leaves = cidr_tree.leaves();
-    let cidr = match peer_type {
-        PeerType::User => {
-            leaves.iter().filter(|cidr| cidr.name == "operators").collect::<Vec<_>>().first().cloned()
-        }
-        PeerType::Operator => {
-            leaves.iter().filter(|cidr| cidr.name == "operators").collect::<Vec<_>>().first().cloned()
-        }
-        PeerType::Instance => {
-            leaves.iter().filter(|cidr| cidr.name == "vm-subnet").collect::<Vec<_>>().first().cloned()
-        }
-    }.ok_or(
-        Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "CIDRs are not properly set up"
-            )
-        )
-    )?;
+    log::info!("Converted CIDRs into leaves");
+    let cidr = leaves.iter().filter(|cidr| cidr.name == "peers-1")
+        .collect::<Vec<_>>()
+        .first()
+        .cloned()
+        .ok_or(
+            {
+                log::error!("Unable to get CIDR");
+                Box::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "CIDRs are not properly set up"
+                    )
+                )
+            }
+        )?;
 
-    log::info!("Choose CIDR: {cidr:?}");
+    log::info!("Assigned CIDR to {peer_id}: {cidr}");
 
     let mut available_ip = None;
     let candidate_ips = cidr.hosts().filter(|ip| cidr.is_assignable(ip));
@@ -74,12 +73,13 @@ pub async fn add_peer<'a>(
             )
         )
     )?;
-    log::info!("Choose IP: {ip:?}");
+    log::info!("Assigned IP: {ip:?} to {peer_id}");
 
     let default_keypair = KeyPair::generate();
 
     log::info!("Generated Keypair");
 
+    /*
     let invite_expires: Timestring = "1d".parse().map_err(|e| {
         Box::new(
             std::io::Error::new(
@@ -88,9 +88,10 @@ pub async fn add_peer<'a>(
             )
         )
     })?; 
+    */
     log::info!("Generated expiration");
 
-    let name = Hostname::from_str(peer_id)?;
+    let name = Hostname::from_str(&peer_id.split("_").collect::<Vec<_>>().join("-"))?;
     log::info!("Generated Hostname");
 
     let peer_request = PeerContents {
@@ -106,7 +107,7 @@ pub async fn add_peer<'a>(
         is_disabled: false,
         is_redeemed: false,
         persistent_keepalive_interval: Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS),
-        invite_expires: Some(SystemTime::now() + invite_expires.into()),
+        invite_expires: None, 
         candidates: vec![],
     };
 
@@ -133,13 +134,34 @@ pub async fn server_add_peer(
     let cidr_tree = CidrTree::new(&cidrs[..]);
 
     log::info!("calling add peer to get key pair and contents...");
-    let (contents, keypair) = add_peer(&peers, &cidr_tree, peer_type, peer_id).await?;
+    let (contents, keypair) = match add_peer(&peers, &cidr_tree, peer_type, peer_id).await {
+        Ok((contents, keypair)) => (contents, keypair),
+        Err(e) => {
+            log::error!("Error while attempting to add peer: {e}");
+            return Err(
+                Box::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e
+                    )
+                )
+            )
+        },
+    };
 
     log::info!("Getting Server Peer...");
     let server_peer = DatabasePeer::get(&conn, 1)?;
 
     log::info!("Creating peer...");
     let peer = DatabasePeer::create(&conn, contents)?;
+
+    if Device::get(
+        inet, Backend::Kernel 
+    ).is_ok() {
+        DeviceUpdate::new()
+            .add_peer(PeerConfigBuilder::from(&*peer))
+            .apply(inet, Backend::Kernel)?;
+    }
 
     log::info!("building invitation...");
     let peer_invitation = InterfaceConfig {
@@ -153,7 +175,7 @@ pub async fn server_add_peer(
             external_endpoint: server_peer
                 .endpoint
                 .clone()
-                .expect("The innernet server should have a WireGuard endpoint"),
+                .expect("The formnet server should have a WireGuard endpoint"),
             internal_endpoint: SocketAddr::new(config.address, config.listen_port),
             public_key: server_peer.public_key.clone(),
         },
@@ -273,9 +295,12 @@ pub struct FormnetSubscriber {
 
 impl FormnetSubscriber {
     pub async fn new(uri: &str, topics: Vec<String>) -> std::io::Result<Self> {
+        log::info!("Attempting to connect to broker: {uri}");
         let mut stream = TcpStream::connect(uri).await?;
+        log::info!("Created TCP stream to broker: {uri}");
         let topic_str = topics.join(",");
         stream.write_all(topic_str.as_bytes()).await?;
+        log::info!("Successfully subscribed to broker: {uri}");
         Ok(Self { stream })
     }
 }
@@ -402,6 +427,7 @@ async fn handle_join_request_from_server(
     ).await {
         Ok(invitation) => {
             let resp = JoinResponse::Success { invitation };
+            log::info!("SUCCESS! Sending Response: {resp:?}");
             return (
                 StatusCode::OK,
                 Json(resp)
@@ -815,18 +841,21 @@ pub fn init(
     conf: &ServerConfig,
     opts: InitializeOpts
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    log::info!("Setting up directories for configs...");
     shared::ensure_dirs_exist(&[conf.config_dir(), conf.database_dir()]).map_err(|e| {
         Box::new(
             e
         )
     })?;
 
+    log::info!("Acquiring interface name...");
     let name: Interface = if let Some(name) = opts.network_name {
         name
     } else {
         Interface::from_str("formnet")?
     };
 
+    log::info!("Acquiring root cidr...");
     let root_cidr: IpNet = if let Some(cidr) = opts.network_cidr {
         cidr
     } else {
@@ -836,6 +865,7 @@ pub fn init(
         )?
     };
 
+    log::info!("Acquiring listen port...");
     let listen_port: u16 = if let Some(listen_port) = opts.listen_port {
         listen_port
     } else {
@@ -844,6 +874,7 @@ pub fn init(
 
     log::info!("listen port: {}", listen_port);
 
+    log::info!("Acquiring endpoint from public ip...");
     let endpoint: Endpoint = if let Some(endpoint) = opts.external_endpoint {
         endpoint
     } else {
@@ -864,17 +895,21 @@ pub fn init(
         .find(|ip| root_cidr.is_assignable(ip))
         .unwrap();
 
+    log::info!("Acquired formnet ip {our_ip}...");
     let config_path = conf.config_path(&name);
     let our_keypair = KeyPair::generate();
 
+    log::info!("building config...");
     let config = ConfigFile {
         private_key: our_keypair.private.to_base64(),
         listen_port,
         address: our_ip,
         network_cidr_prefix: root_cidr.prefix_len(),
     };
+    log::info!("writing config to config dir...");
     config.write_to_path(config_path)?;
 
+    log::info!("Setting up Database Initial direcotry...");
     let db_init_data = DbInitData {
         network_name: name.to_string(),
         network_cidr: root_cidr,
@@ -884,6 +919,7 @@ pub fn init(
         endpoint,
     };
 
+    log::info!("Populating database initially...");
     let database_path = conf.database_path(&name);
     let conn = create_database(&database_path)?;
     populate_database(&conn, db_init_data)?;
@@ -893,6 +929,25 @@ pub fn init(
         "[*]",
         database_path.to_string_lossy()
     );
+
+    log::info!("Setup up initial database... Adding CIDR");
+    let cidr_opts = AddCidrOpts {
+        name: Some(Hostname::from_str("peers-1")?),
+        parent: Some("formnet".to_string()),
+        cidr: Some(IpNet::new(
+            IpAddr::V4(
+                Ipv4Addr::new(
+                    10, 1, 0, 0
+                )
+            ),
+            16
+        )?),
+        yes: true,
+    };
+
+    add_cidr(&*name, conf, cidr_opts)?;
+
+    log::info!("Added CIDR");
     Ok(())
 }
 
